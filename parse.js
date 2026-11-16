@@ -1276,7 +1276,20 @@ let refsGlobal = new Map();
 // collects link reference definitions (they may appear after their use),
 // and its inline output is discarded. Block structure and def collection
 // never depend on inline output, so the suppressed pass is safe.
-let collectOnly = false;
+// Deferred inline rendering (single-pass architecture): block parsing
+// records paragraph/heading/table-cell inline jobs instead of rendering
+// them, so ONE block pass both collects link reference definitions and
+// determines list tightness. Jobs resolve in document order at the end
+// of parse(), when the reference map is complete. A paragraph job's <p>
+// wrapper depends on its enclosing list's tightness, known only after
+// all items are parsed — the job holds a reference to the list's mutable
+// flag object ({t: bool}; null = always wrap in <p>).
+let inlineJobs = [];
+function inlineJob(text, kind, flag) {
+  const idx = inlineJobs.length;
+  inlineJobs.push({ text, kind, flag, checkbox: null });
+  return '\u0000' + idx + '\u0000';
+}
 
 // Document-persistent "inside <a>" flag (marked's Lexer.state.inLink).
 // A raw "<a " tag tokenized as inline HTML sets it; a raw "</a>" tag
@@ -1519,7 +1532,6 @@ function handleDelimRun(s, out, delims, starSpans, ch, n, canOpen, canClose, pos
 }
 
 function inlineParse(s, refs, inLink) {
-  if (collectOnly) return '';
   refsGlobal = refs;
   // Fast path: plain text with no inline syntax at all (no backslash,
   // code, emphasis, links, tags, autolinks, emails, or '![' images) —
@@ -2324,7 +2336,7 @@ function tryParseTable(lines, i, b, refs) {
   let html = '<table>\n<thead>\n<tr>\n';
   for (let k = 0; k < header.length; k++) {
     const a = aligns[k];
-    html += '<th' + (a ? ' align="' + a + '"' : '') + '>' + inlineParse(header[k], refs, false) + '</th>\n';
+    html += '<th' + (a ? ' align="' + a + '"' : '') + '>' + inlineJob(header[k], 'inline', null) + '</th>\n';
   }
   html += '</tr>\n</thead>\n';
   if (rows.length > 0) {
@@ -2335,7 +2347,7 @@ function tryParseTable(lines, i, b, refs) {
       for (let k = 0; k < header.length; k++) {
         const a = aligns[k];
         const cell = k < cells.length ? cells[k] : '';
-        html += '<td' + (a ? ' align="' + a + '"' : '') + '>' + inlineParse(cell, refs, false) + '</td>\n';
+        html += '<td' + (a ? ' align="' + a + '"' : '') + '>' + inlineJob(cell, 'inline', null) + '</td>\n';
       }
       html += '</tr>\n';
     }
@@ -2345,7 +2357,7 @@ function tryParseTable(lines, i, b, refs) {
   return { html, next: j };
 }
 
-function parseBlocks(lines, a, b, refs, tailNl, tight, lazy) {
+function parseBlocks(lines, a, b, refs, tailNl, tightFlag, lazy) {
   let html = '';
   const blocks = [];
   let effLastType = null;
@@ -2366,7 +2378,7 @@ function parseBlocks(lines, a, b, refs, tailNl, tight, lazy) {
     } else {
       const atx = matchAtx(line);
       if (atx) {
-        frag = '<h' + atx.depth + '>' + inlineParse(atx.text, refs, false) + '</h' + atx.depth + '>\n';
+        frag = '<h' + atx.depth + '>' + inlineJob(atx.text, 'inline', null) + '</h' + atx.depth + '>\n';
         type = 'heading'; next = i + 1;
       } else {
         const fence = matchFence(line);
@@ -2493,7 +2505,7 @@ function parseBlocks(lines, a, b, refs, tailNl, tight, lazy) {
               if (tbl) {
                 frag = tbl.html; type = 'table'; next = tbl.next;
               } else {
-                const para = parseParagraph(lines, i, b, refs, tight, lazy);
+                const para = parseParagraph(lines, i, b, refs, tightFlag, lazy);
                 frag = para.html; type = para.type; next = para.next;
               }
             }
@@ -2517,7 +2529,7 @@ function parseBlocks(lines, a, b, refs, tailNl, tight, lazy) {
 // continuations (from a blockquote or list item): they never interrupt
 // the paragraph, never form a setext heading, and a whitespace-only lazy
 // line is kept as text (cm-241) instead of ending the paragraph.
-function parseParagraph(lines, i, b, refs, tight, lazy) {
+function parseParagraph(lines, i, b, refs, tightFlag, lazy) {
   const plines = [];
   let j = i;
   while (j < b) {
@@ -2530,7 +2542,7 @@ function parseParagraph(lines, i, b, refs, tight, lazy) {
       // The heading content is the paragraph text with leading/trailing
       // whitespace stripped (cm-082/084/089: "  Foo", "Foo  " -> "Foo").
       const text = plines.join('\n').trim();
-      return { html: '<h' + se.depth + '>' + inlineParse(text, refs, false) + '</h' + se.depth + '>\n', type: 'heading', next: j + 1 };
+      return { html: '<h' + se.depth + '>' + inlineJob(text, 'inline', null) + '</h' + se.depth + '>\n', type: 'heading', next: j + 1 };
     }
     // A link reference definition is only recognized at the start of a
     // block (parseBlocks checks tryParseDef before calling us); once a
@@ -2541,9 +2553,10 @@ function parseParagraph(lines, i, b, refs, tight, lazy) {
     j++;
   }
   if (plines.length === 0) return { html: '', type: 'paragraph', next: j };
-  const inner = inlineParse(plines.join('\n'), refs, false);
-  if (tight) return { html: inner, type: 'paragraph', next: j };
-  return { html: '<p>' + inner + '</p>\n', type: 'paragraph', next: j };
+  // Inline rendering is deferred: the <p> wrapper depends on the
+  // enclosing list's tightness (the tight flag), decided after all
+  // items are parsed. The job resolves at the end of parse().
+  return { html: inlineJob(plines.join('\n'), 'para', tightFlag), type: 'paragraph', next: j };
 }
 
 // Blockquote: lines starting with '>' plus lazy paragraph continuations.
@@ -2568,7 +2581,7 @@ function parseBlockquote(lines, i, b, refs, tailNl) {
     // A lazy line must follow non-blank content: after a blank line the
     // paragraph is closed and the line is outside the quote (cm-249).
     if (content.length > 0 && !isBlank(line) && !isBlank(content[content.length - 1])) {
-      const inner = parseBlocks(content, 0, content.length, refs, false, false);
+      const inner = parseBlocks(content, 0, content.length, refs, false, null);
       if (inner.lastType === 'paragraph' && !interruptsParagraph(line)) {
         // Lazy continuation: strip leading whitespace only when the line
         // is indented by 4+ columns (cm-238: "    - bar" -> "- bar");
@@ -2587,7 +2600,7 @@ function parseBlockquote(lines, i, b, refs, tailNl) {
     }
     break;
   }
-  const inner = parseBlocks(content, 0, content.length, refs, j < b ? true : tailNl, false, lazy);
+  const inner = parseBlocks(content, 0, content.length, refs, j < b ? true : tailNl, null, lazy);
   return { html: '<blockquote>\n' + inner.html + '</blockquote>\n', next: j, lastType: inner.lastType };
 }
 
@@ -2737,7 +2750,7 @@ function parseList(lines, i, b, refs, tailNl) {
         lazyDepth++;
         inListItem++;
         try {
-          lastTypeSoFar = parseBlocks(itemLines, 0, itemLines.length, refs, false, false).lastType;
+          lastTypeSoFar = parseBlocks(itemLines, 0, itemLines.length, refs, false, null).lastType;
         } finally { inListItem--; lazyDepth--; }
       }
       if (lastTypeSoFar === 'paragraph' && !interruptsParagraph(l)) {
@@ -2774,22 +2787,19 @@ function parseList(lines, i, b, refs, tailNl) {
   }
   // Looseness: blank lines between items, or a blank line between two
   // top-level blocks of one item (a gap between consecutive parsed
-  // blocks). Parse once with tight=true to read the block structure,
-  // then re-parse with the correct tightness if the list is loose.
-  // Blank lines inside a nested list or a fenced code block do not make
-  // the parent loose (cm-307/318/319).
-  // The provisional parse runs all items before the (possible) re-parse,
-  // so for a loose list it would advance the document-persistent
-  // docInLink flag past content the re-parse has not reached yet (an
-  // email in an early item could be wrongly suppressed by a "<a " tag
-  // in a later item). Snapshot it and restore before re-parsing; for a
-  // tight list the provisional output is used as-is and the flag is
-  // already correct.
-  const docInLinkBeforeList = docInLink;
+  // blocks). Blank lines inside a nested list or a fenced code block
+  // do not make the parent loose (cm-307/318/319).
+  // Single parse, no re-parse: paragraph jobs hold a reference to this
+  // list's mutable tight flag, so when the list turns out loose the
+  // flag flips here and the jobs render WITH <p> wrappers when they
+  // resolve at the end of parse(). Inline rendering is deferred, so
+  // the document-persistent docInLink flag is untouched during block
+  // parsing and evolves in document order during resolution.
+  const tightFlag = { t: true };
   const provisional = items.map(item => {
     inListItem++;
     let inner;
-    try { inner = parseBlocks(item.lines, 0, item.lines.length, refs, item.lastIdx + 1 < b ? true : tailNl, true, item.lazy); }
+    try { inner = parseBlocks(item.lines, 0, item.lines.length, refs, item.lastIdx + 1 < b ? true : tailNl, tightFlag, item.lazy); }
     finally { inListItem--; }
     return { item, inner };
   });
@@ -2803,8 +2813,7 @@ function parseList(lines, i, b, refs, tailNl) {
       if (listLoose) break;
     }
   }
-  const tight = !listLoose;
-  if (!tight) docInLink = docInLinkBeforeList;
+  tightFlag.t = !listLoose;
   let html = ordered ? '<ol' + (startNum !== 1 ? ' start="' + startNum + '"' : '') + '>\n' : '<ul>\n';
   let lastType = null;
   for (const { item, inner } of provisional) {
@@ -2812,22 +2821,23 @@ function parseList(lines, i, b, refs, tailNl) {
     // follows it in the parent range, else it inherits the parent's tailNl
     // (a trailing blank line consumed by the item still means "followed",
     // because lastIdx points at the last line actually pushed).
-    // If the list is tight the provisional parse is already correct; if
-    // loose, re-parse with tight=false for the <p> wrappers. In
-    // collectOnly mode (pass 1) the output is discarded and the
-    // provisional parse already collected every definition in the
-    // items, so the re-parse is pure waste — skip it.
-    const useInner = (tight || collectOnly) ? inner : (() => { inListItem++; try { return parseBlocks(item.lines, 0, item.lines.length, refs, item.lastIdx + 1 < b ? true : tailNl, false, item.lazy); } finally { inListItem--; } })();
-    lastType = useInner.lastType;
-    let itemHtml = useInner.html;
+    lastType = inner.lastType;
+    let itemHtml = inner.html;
     if (item.task) {
       const cb = item.task.checked
         ? '<input checked="" disabled="" type="checkbox">'
         : '<input disabled="" type="checkbox">';
       // The checkbox goes at the start of the first block's content:
-      // after the opening <p> for a loose item, else at the very start.
-      if (itemHtml.startsWith('<p>')) itemHtml = '<p>' + cb + ' ' + itemHtml.slice(3);
-      else itemHtml = cb + ' ' + itemHtml;
+      // inside the opening <p> for a loose paragraph, else at the very
+      // start. A leading paragraph job is marked so the checkbox is
+      // inserted when the job resolves (its <p> wrapper is decided
+      // then); any other first block keeps the plain prepend.
+      if (itemHtml.charCodeAt(0) === 0) {
+        const end = itemHtml.indexOf('\u0000', 1);
+        const job = inlineJobs[+itemHtml.slice(1, end)];
+        if (job && job.kind === 'para') job.checkbox = cb;
+        else itemHtml = cb + ' ' + itemHtml;
+      } else itemHtml = cb + ' ' + itemHtml;
     }
     html += '<li>' + itemHtml + '</li>\n';
   }
@@ -2843,17 +2853,26 @@ export function parse(src) {
   if (src.indexOf('\r') >= 0) src = src.replace(/\r\n?/g, '\n');
   const lines = src.split('\n');
   const refs = new Map();
-  // Pass 1: collect every link reference definition in the document
-  // using the real block parser, so definitions inside fenced code
-  // blocks (including fences in blockquotes and list items, where a
-  // line scan mis-tracks openers/closers — doc-13/23) are NOT
-  // collected, exactly as marked does. inlineParse is suppressed
-  // (collectOnly), so this pass is block structure + definitions
-  // only; its output is discarded. Definitions may appear after the
-  // links that use them. Pass 2 renders with the complete map.
-  collectOnly = true;
-  parseBlocks(lines, 0, lines.length, refs, false, false);
-  collectOnly = false;
-  docInLink = false;
-  return parseBlocks(lines, 0, lines.length, refs, false, false).html;
+  // Single pass: the block parser collects link reference definitions
+  // as it goes (using the real block structure, so definitions inside
+  // fenced code blocks — including fences in blockquotes and list
+  // items, where a line scan mis-tracks openers/closers — doc-13/23
+  // — are NOT collected, exactly as marked does), and records inline
+  // jobs instead of rendering them. Definitions may appear after the
+  // links that use them; jobs resolve below, when the map is complete.
+  inlineJobs = [];
+  const html = parseBlocks(lines, 0, lines.length, refs, false, null).html;
+  if (inlineJobs.length === 0) return html;
+  // Resolve jobs in document order (placeholders appear in the html in
+  // document order), so the docInLink flag evolves exactly as in the
+  // old rendering pass.
+  return html.replace(/\u0000(\d+)\u0000/g, (m, n) => {
+    const job = inlineJobs[+n];
+    const inner = inlineParse(job.text, refs, false);
+    if (job.kind === 'para') {
+      const text = job.checkbox ? job.checkbox + ' ' + inner : inner;
+      return job.flag && job.flag.t ? text : '<p>' + text + '</p>\n';
+    }
+    return inner;
+  });
 }
