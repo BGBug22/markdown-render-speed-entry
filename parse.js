@@ -39,6 +39,23 @@ const UNILETNUM_RE = /[\p{L}\p{N}]/u;
 const WORDCHAR_START_RE = /^[\p{L}\p{N}~]/u;
 const WORDCHAR_END_RE = /[\p{L}\p{N}~]$/u;
 
+// Escape a plain text run: a run never contains '&', '<' or '>'
+// (the scanner stops at them), so only ' and " need escaping — and
+// decodeNumericRefs on a run is always a no-op (it needs '&#').
+// Two indexOf scans (C-speed) skip the work entirely for most runs.
+function escapeTextRun(s) {
+  if (s.indexOf("'") < 0 && s.indexOf('"') < 0) return s;
+  let out = '', start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    let rep = null;
+    if (c === 39) rep = '&#39;';
+    else if (c === 34) rep = '&quot;';
+    if (rep) { out += s.slice(start, i) + rep; start = i + 1; }
+  }
+  return start === 0 ? s : out + s.slice(start);
+}
+
 // Escape text content: & < > " '. Entities are NOT kept here — in text
 // they are recognized by parseEntity before a text run starts; in code
 // spans and code blocks a raw & must become &amp; (cm-035, cm-036).
@@ -94,9 +111,16 @@ function decodeNumericRefs(s) {
   return start === 0 ? s : out + s.slice(start);
 }
 
+// Characters cleanUrl's loop re-encodes: control chars + space, " < >
+// [ \ ] `, DEL, and every non-ASCII char. A URL with none of them (and
+// no '%' / '&#' to decode) is already clean — one C-speed regex test
+// replaces decodeURIComponent + decodeNumericRefs + the per-char loop.
+const CLEAN_URL_ENCODE_RE = /[\x00-\x20"<>\\[\]`\x7F-\uFFFF]/;
+
 // Clean a link/image URL the way marked does: decode %XX and numeric refs,
 // then re-encode spaces and unsafe chars; `&` becomes `&amp;` at render time.
 function cleanUrl(href) {
+  if (href.indexOf('%') < 0 && href.indexOf('&#') < 0 && !CLEAN_URL_ENCODE_RE.test(href)) return href;
   try { href = decodeURIComponent(href.replace(/%25/g, '%2525')); } catch (e) { /* keep as-is */ }
   href = decodeNumericRefs(href);
   // Encode characters that must not appear raw in an href: space, quote,
@@ -246,7 +270,7 @@ function stripFirstCols(line, m) {
   return out.slice(m.contentCol) + line.slice(i);
 }
 
-// True when the line is blank (only spaces/tabs).
+// True when line is blank (only spaces/tabs).
 function isBlank(line) {
   for (let i = 0; i < line.length; i++) {
     const c = line.charCodeAt(i);
@@ -255,21 +279,52 @@ function isBlank(line) {
   return true;
 }
 
+// True if s has "http://" or "https://" at j (scheme case-insensitive).
+// Allocation-free: compares char codes directly instead of
+// s.slice(j, j+7).toLowerCase() — the old form allocated two strings
+// for EVERY 'h' in a text run (the, this, that, ...). The |32 trick
+// maps exactly 'T'->'t', 'P'->'p', 'S'->'s' (only those codes produce
+// 116/112/115); charCodeAt past the end yields NaN, which fails.
+function isHttpAt(s, j) {
+  if ((s.charCodeAt(j + 1) | 32) !== 116) return false; // 't'
+  if ((s.charCodeAt(j + 2) | 32) !== 116) return false; // 't'
+  if ((s.charCodeAt(j + 3) | 32) !== 112) return false; // 'p'
+  const c4 = s.charCodeAt(j + 4);
+  if (c4 === 58) return true; // ':'
+  if ((c4 | 32) !== 115) return false; // 's'
+  return s.charCodeAt(j + 5) === 58;
+}
+
 // ---------------- Inline parsing ----------------
 
-// Find the end of a code span starting at run of `n` backticks at index `start`.
-// Returns index just past the closing run, or -1.
+// Sticky stop-set for a plain text run in inlineParse: the next
+// backslash, backtick, emphasis delimiter, bracket, '!', '<', '&',
+// '>', or newline — or a "www." / "http(s)://" start (scheme
+// case-insensitive, "www." lowercase-only, exactly as the branch
+// chain it replaces). Spaces and tabs are NOT stops: they ride
+// inside the run (a run ending in 2+ of them before '\n' is a hard
+// break, checked after the run). One regex scan (C-speed) replaces
+// the per-character JS loop. Shared across inlineParse calls: every
+// use sets lastIndex before exec, so nested calls cannot corrupt a scan.
+const TEXT_STOP = /[\\`*_~\[!<>&>\n]|www\.|[hH][tT][tT][pP][sS]?:\/\//g;
+// Same stop set as TEXT_STOP plus '@' (email autolink), minus '!' and
+// without the /g flag: a stateless test for the inlineParse plain-text
+// fast path. A lone '!' is literal in the main loop, so it may ride the
+// fast path; only '![' (image) needs the main loop, caught by the
+// separate indexOf('![') check at the call site.
+const PLAIN_STOP = /[\\`*_~\[<>&>\n@]|www\.|[hH][tT][tT][pP][sS]?:\/\//;
 function findCodeSpanEnd(s, start, n) {
+  // Jump to the next backtick with indexOf (C-speed) instead of
+  // stepping char by char through long code-span content.
   let i = start + n;
-  while (i < s.length) {
-    if (s.charCodeAt(i) === 96) {
-      let j = i, len = 0;
-      while (j < s.length && s.charCodeAt(j) === 96) { j++; len++; }
-      if (len === n) return j;
-      i = j;
-    } else i++;
+  while (true) {
+    const b = s.indexOf('`', i);
+    if (b < 0) return -1;
+    let j = b, len = 0;
+    while (j < s.length && s.charCodeAt(j) === 96) { j++; len++; }
+    if (len === n) return j;
+    i = j;
   }
-  return -1;
 }
 
 // Parse a code span at index i (s[i] === '`'). Returns {html, next} or null.
@@ -757,7 +812,8 @@ function findLinkEnd(s, i, allowNested) {
       // the span, so it does swallow the "]" and no link forms).
       // A span with backtick-free content still skips "]" inside it
       // (cm-524/526/538).
-      if (sawLiteralBacktick || s.slice(k, end - n).includes('`')) { j = k; sawLiteralBacktick = true; continue; }
+      const bi = s.indexOf('`', k);
+      if (sawLiteralBacktick || (bi >= 0 && bi < end - n)) { j = k; sawLiteralBacktick = true; continue; }
       j = end;
       continue;
     }
@@ -1239,8 +1295,239 @@ let docInLink = false;
 // delims: stack of {ch, rem, canOpen, canClose, idx}
 // idx points at the out element holding this run: for an opener it is
 //   delimChars(rem) + tags; for a closer it is tags + delimChars(rem).
+// Chars the inline branch chain must see first: backslash, backtick,
+// newline, emphasis, strikethrough, link/image openers, tag/entity
+// openers, '>', and the extended-autolink starters w/h/H. Every other
+// char starts a plain text run at once, skipping the ~12 failed
+// comparisons of the branch chain. '@' is deliberately absent: it rides
+// inside text runs and the run tail tries the email autolink.
+const SPECIAL = new Uint8Array(128);
+for (const ch of '\\`\n*_~[!<&>whH') SPECIAL[ch.charCodeAt(0)] = 1;
+
+// Start position of the last code span at or after `from` in s (mimics
+// an inlineParse left-to-right scan), or -1 if there is none. Module
+// level (not a per-call closure) so its call sites stay monomorphic.
+function findLastCodeSpanStart(s, from) {
+  let last = -1, k = from;
+  while (k < s.length) {
+    if (s[k] === '`') {
+      const cs = parseCodeSpan(s, k);
+      if (cs) { last = k; k = cs.next; continue; }
+      while (k < s.length && s[k] === '`') k++;
+      continue;
+    }
+    k++;
+  }
+  return last;
+}
+
+// --- Emphasis helpers, module level (not per-call closures) ---
+// These were closures inside inlineParse; hoisting them with the
+// per-call state (s, out, delims, starSpans) as explicit parameters
+// keeps their call sites monomorphic, so the optimizer can inline
+// them instead of deoptimizing on a fresh closure object per call.
+// Bodies are byte-identical to the old closures apart from the
+// signatures and the three internal calls below.
+
+// True if there is a lone "*" in s[from..to) that is not part of a
+// matched span, is a single "*" (not part of a "**" run), and is
+// followed by whitespace or end of input (so it can close but not
+// open). Such a "*" keeps a bad inner em from blocking an enclosing
+// strong span (probed: "**a *b*c* d**" and doc-01 form the strong,
+// while "**a *b*c**" does not; a "*" that forms an em itself does
+// not count, e.g. "**a *b*c*d**" still fails).
+function hasLoneCloserStar(s, starSpans, from, to) {
+  for (let i = from; i < to; i++) {
+    if (s[i] !== '*') continue;
+    if (s[i - 1] === '*' || s[i + 1] === '*') continue; // part of a run
+    const after = i + 1 >= s.length ? '' : s[i + 1];
+    if (after !== '' && !isUniSpace(after.charCodeAt(0))) continue;
+    let isDelim = false;
+    for (let k = starSpans.length - 1; k >= 0; k--) {
+      const sp = starSpans[k];
+      if (sp[1] <= i) break; // ascending order: earlier spans end even sooner
+      if ((i >= sp[0] && i < sp[0] + sp[2]) || (i >= sp[1] - sp[2] && i < sp[1])) { isDelim = true; break; }
+    }
+    if (!isDelim) return true;
+  }
+  return false;
+}
+
+// True if forming an emphasis span of type `use` (1 = em, 2 = strong)
+// between opener o and closer rec would enclose a span of the
+// OPPOSITE type that is not attached to a preceding word character
+// but is directly followed by one — marked leaves such a span literal
+// (probed: "*a **b**c*" stays literal, "**a *b*c**" stays literal,
+// while "*foo**bar**baz*", "*a **b** c*", "*a 1**b**c*" form it).
+// A lone closer-only "*" between a bad inner em and the outer closer
+// lifts the block for a strong span (doc-01, "**a *b*c* d**"); it
+// does not lift it for an em span ("*a **b**c* d *e* f" stays literal).
+function badInnerSpan(s, starSpans, o, rec, n, use) {
+  if (starSpans.length === 0) return false;
+  const other = 3 - use; // opposite type: em <-> strong
+  const start = o.pos + o.origN; // content starts after the opener run
+  const end = rec.pos + (n - rec.rem); // content ends at the closer run
+  for (let k = starSpans.length - 1; k >= 0; k--) {
+    const sp = starSpans[k];
+    if (sp[2] !== other) continue;
+    if (sp[1] > end) continue; // span ends after this closer; earlier ones may fit
+    if (sp[1] <= start) break; // ascending order: earlier ones end even sooner
+    if (sp[0] < start) continue; // starts before the content: overlaps, not inside
+    // Attached to a preceding word character? Then it does not block.
+    if (sp[0] > 0 && WORDCHAR_END_RE.test(s.slice(Math.max(0, sp[0] - 2), sp[0]))) continue;
+    // Directly followed by a word character? Then it blocks, unless
+    // a lone closer-only "*" intervenes (strong spans only).
+    if (sp[1] < s.length && WORDCHAR_START_RE.test(s.slice(sp[1], sp[1] + 2))) {
+      if (use === 2 && hasLoneCloserStar(s, starSpans, sp[1], end)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+// True if a later "**" run in the source looks closable as a strong
+// (right-flanking). When a single "*" closer would split a "**"
+// opener that has exactly 2 delimiters left, marked instead leaves
+// the "*" literal and lets the later "**" close the strong
+// ("**public as *so*other* option html**"). Returns false if a
+// backtick intervenes (a code span may hide the "**", and the
+// lookahead cannot see through it).
+function laterStrongCloser(s, from) {
+  let k = from;
+  while (true) {
+    const idx = s.indexOf('**', k);
+    if (idx < 0) return false;
+    const tick = s.indexOf('`', k);
+    if (tick >= 0 && tick < idx) return false;
+    let j = idx + 2;
+    while (j < s.length && s[j] === '*') j++;
+    const before = idx === 0 ? '' : s[idx - 1];
+    const after = j < s.length ? s[j] : '';
+    const bSpace = before === '' || isUniSpace(before.charCodeAt(0)) || before === '\n';
+    const aSpace = after === '' || isUniSpace(after.charCodeAt(0)) || after === '\n';
+    const bPunct = before !== '' && isUniPunct(before.charCodeAt(0));
+    const aPunct = after !== '' && isUniPunct(after.charCodeAt(0));
+    if (!bSpace && (!bPunct || aSpace || aPunct)) return true;
+    k = j;
+  }
+}
+
+function handleDelimRun(s, out, delims, starSpans, ch, n, canOpen, canClose, pos) {
+  // push the run as its own fragment
+  out.push(ch.repeat(n));
+  const idx = out.length - 1;
+  const rec = { ch, rem: n, canOpen, canClose, idx, pos, origN: n };
+  if (canClose) {
+    // try to match openers
+    while (rec.rem > 0) {
+      let found = -1;
+      let closeFromEnd = false; // strong takes the LAST two of the closer run (see below)
+      for (let d = delims.length - 1; d >= 0; d--) {
+        const o = delims[d];
+        if (o.ch !== ch || !o.canOpen) continue;
+        // Odd-match rule: if either delimiter can both open and close,
+        // the SUM of the two run lengths must not be a multiple of 3
+        // unless both lengths are multiples of 3 (cm-411 "*foo**bar**"
+        // must not match the lone "*" with the "**").
+        if ((o.canClose || rec.canOpen) && (o.rem + rec.rem) % 3 === 0 &&
+            (o.rem % 3 !== 0 || rec.rem % 3 !== 0)) continue;
+        // marked emphasis quirks (probed against marked 18.1.3; not
+        // CommonMark). A "*" span must not enclose a span of the
+        // OPPOSITE type that is not attached to a preceding word
+        // character (letter, digit or '~') but is directly followed
+        // by one ("*a **b**c*" and "**a *b*c**" stay literal).
+        // For an em span the closer stays literal. For a strong span
+        // with exactly 2 delimiters left in the closer run the closer
+        // also stays literal; with 3+ left the strong still forms but
+        // takes the LAST two of the run, so the extra delimiters land
+        // inside it as literal content ("**a *b*c***" ->
+        // "<strong>a <em>b</em>c*</strong>").
+        if (ch === '*') {
+          const useCand = (o.rem >= 2 && rec.rem >= 2) ? 2 : 1;
+          if (badInnerSpan(s, starSpans, o, rec, n, useCand)) {
+            if (useCand === 1 || rec.rem === 2) continue;
+            closeFromEnd = true;
+          } else if (useCand === 1) {
+            // A single "*" closer must not split a "**" opener that
+            // has exactly 2 left when a later "**" can close it as a
+            // strong ("**public as *so*other* option html**").
+            // With 3+ left (cm-430 "***foo* bar**") the split still
+            // leaves a strong, so the em is allowed.
+            if (o.rem === 2 && laterStrongCloser(s, pos + n)) continue;
+          }
+        }
+        found = d;
+        break;
+      }
+      if (found < 0) break;
+      const o = delims[found];
+      const use = (o.rem >= 2 && rec.rem >= 2) ? 2 : 1;
+      const tag = use === 2 ? ['<strong>', '</strong>'] : ['<em>', '</em>'];
+      // opener element = remaining chars + old tags
+      const oEl = out[o.idx];
+      out[o.idx] = ch.repeat(o.rem - use) + tag[0] + oEl.slice(o.rem);
+      // closer element = old tags + remaining chars. Normally the
+      // matched delimiters are the FIRST `use` of the closer run and
+      // the rest stay after the tag; when closeFromEnd the matched
+      // delimiters are the LAST `use` and the rest go before the tag
+      // as literal content.
+      const cEl = out[rec.idx];
+      if (closeFromEnd) {
+        out[rec.idx] = cEl.slice(0, cEl.length - rec.rem) + ch.repeat(rec.rem - use) + tag[1];
+      } else {
+        out[rec.idx] = cEl.slice(0, cEl.length - rec.rem) + tag[1] + ch.repeat(rec.rem - use);
+      }
+      // Record "*" emphasis spans (source range + use) for
+      // badInnerSpan. The opening delimiter(s) are the last `use` of
+      // the opener run; the closing delimiter(s) are the first `use`
+      // of the closer run (or the last `use` when closeFromEnd).
+      // Only "*" spans count; "__" does not.
+      if (ch === '*') {
+        const closeEnd = closeFromEnd ? rec.pos + n : rec.pos + (n - rec.rem) + use;
+        starSpans.push([o.pos + o.origN - use, closeEnd, use]);
+      }
+      o.rem -= use;
+      rec.rem -= use;
+      if (closeFromEnd) rec.rem = 0; // the rest of the run is literal content now
+      // Openers between the matched opener and this closer are now
+      // inside the created emphasis: they can no longer form emphasis
+      // spanning its boundary (cm-469 "*foo _bar* baz_" — the "_" inside
+      // must not match the "_" after the closing "*").
+      if (found < delims.length - 1) delims.splice(found + 1);
+      if (o.rem === 0) delims.splice(found, 1);
+    }
+  }
+  if (rec.rem > 0 && rec.canOpen) {
+    // The remainder of this run acted as a closer, so its element now
+    // holds [closing tags][remaining delims]. Split it: the tags stay
+    // in place, and the remaining delims become their own fragment
+    // right after, so a later match treats them as a plain opener
+    // (otherwise the opener slice logic mangles the tags — the
+    // "<em>/em>" corruption in cm-411/412). A run that never matched
+    // as a closer is a pure delimiter run and needs no split.
+    const el = out[rec.idx];
+    if (el.length > rec.rem) {
+      out[rec.idx] = el.slice(0, el.length - rec.rem);
+      out.splice(rec.idx + 1, 0, el.slice(el.length - rec.rem));
+      for (const d of delims) { if (d.idx > rec.idx) d.idx++; }
+      rec.idx = rec.idx + 1;
+    }
+    delims.push(rec);
+  } else if (rec.rem > 0) {
+    // remaining chars are literal; leave the fragment as-is
+  }
+}
+
 function inlineParse(s, refs, inLink) {
   if (collectOnly) return '';
+  refsGlobal = refs;
+  // Fast path: plain text with no inline syntax at all (no backslash,
+  // code, emphasis, links, tags, autolinks, emails, or '![' images) —
+  // just escape ' and ". Skips the closure/array setup of the main
+  // loop; roughly half of all calls (link texts, table cells, plain
+  // paragraphs) take this path. refsGlobal is set first so nested
+  // calls from a later non-fast-path call still see the right refs.
+  if (!PLAIN_STOP.test(s) && s.indexOf('![') < 0) return escapeTextRun(s);
   const out = [];
   const delims = [];
   // Source ranges [openStart, closeEnd, use] of each "*" emphasis span
@@ -1257,92 +1544,8 @@ function inlineParse(s, refs, inLink) {
   // block the outer span (probed: both agree).
   const starSpans = [];
 
-  // True if there is a lone "*" in s[from..to) that is not part of a
-  // matched span, is a single "*" (not part of a "**" run), and is
-  // followed by whitespace or end of input (so it can close but not
-  // open). Such a "*" keeps a bad inner em from blocking an enclosing
-  // strong span (probed: "**a *b*c* d**" and doc-01 form the strong,
-  // while "**a *b*c**" does not; a "*" that forms an em itself does
-  // not count, e.g. "**a *b*c*d**" still fails).
-  function hasLoneCloserStar(from, to) {
-    for (let i = from; i < to; i++) {
-      if (s[i] !== '*') continue;
-      if (s[i - 1] === '*' || s[i + 1] === '*') continue; // part of a run
-      const after = i + 1 >= s.length ? '' : s[i + 1];
-      if (after !== '' && !isUniSpace(after.charCodeAt(0))) continue;
-      let isDelim = false;
-      for (let k = starSpans.length - 1; k >= 0; k--) {
-        const sp = starSpans[k];
-        if (sp[1] <= i) break; // ascending order: earlier spans end even sooner
-        if ((i >= sp[0] && i < sp[0] + sp[2]) || (i >= sp[1] - sp[2] && i < sp[1])) { isDelim = true; break; }
-      }
-      if (!isDelim) return true;
-    }
-    return false;
-  }
-
-  // True if forming an emphasis span of type `use` (1 = em, 2 = strong)
-  // between opener o and closer rec would enclose a span of the
-  // OPPOSITE type that is not attached to a preceding word character
-  // but is directly followed by one — marked leaves such a span literal
-  // (probed: "*a **b**c*" stays literal, "**a *b*c**" stays literal,
-  // while "*foo**bar**baz*", "*a **b** c*", "*a 1**b**c*" form it).
-  // A lone closer-only "*" between a bad inner em and the outer closer
-  // lifts the block for a strong span (doc-01, "**a *b*c* d**"); it
-  // does not lift it for an em span ("*a **b**c* d *e* f" stays literal).
-  function badInnerSpan(o, rec, n, use) {
-    if (starSpans.length === 0) return false;
-    const other = 3 - use; // opposite type: em <-> strong
-    const start = o.pos + o.origN; // content starts after the opener run
-    const end = rec.pos + (n - rec.rem); // content ends at the closer run
-    for (let k = starSpans.length - 1; k >= 0; k--) {
-      const sp = starSpans[k];
-      if (sp[2] !== other) continue;
-      if (sp[1] > end) continue; // span ends after this closer; earlier ones may fit
-      if (sp[1] <= start) break; // ascending order: earlier ones end even sooner
-      if (sp[0] < start) continue; // starts before the content: overlaps, not inside
-      // Attached to a preceding word character? Then it does not block.
-      if (sp[0] > 0 && WORDCHAR_END_RE.test(s.slice(Math.max(0, sp[0] - 2), sp[0]))) continue;
-      // Directly followed by a word character? Then it blocks, unless
-      // a lone closer-only "*" intervenes (strong spans only).
-      if (sp[1] < s.length && WORDCHAR_START_RE.test(s.slice(sp[1], sp[1] + 2))) {
-        if (use === 2 && hasLoneCloserStar(sp[1], end)) continue;
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // True if a later "**" run in the source looks closable as a strong
-  // (right-flanking). When a single "*" closer would split a "**"
-  // opener that has exactly 2 delimiters left, marked instead leaves
-  // the "*" literal and lets the later "**" close the strong
-  // ("**public as *so*other* option html**"). Returns false if a
-  // backtick intervenes (a code span may hide the "**", and the
-  // lookahead cannot see through it).
-  function laterStrongCloser(from) {
-    let k = from;
-    while (true) {
-      const idx = s.indexOf('**', k);
-      if (idx < 0) return false;
-      const tick = s.indexOf('`', k);
-      if (tick >= 0 && tick < idx) return false;
-      let j = idx + 2;
-      while (j < s.length && s[j] === '*') j++;
-      const before = idx === 0 ? '' : s[idx - 1];
-      const after = j < s.length ? s[j] : '';
-      const bSpace = before === '' || isUniSpace(before.charCodeAt(0)) || before === '\n';
-      const aSpace = after === '' || isUniSpace(after.charCodeAt(0)) || after === '\n';
-      const bPunct = before !== '' && isUniPunct(before.charCodeAt(0));
-      const aPunct = after !== '' && isUniPunct(after.charCodeAt(0));
-      if (!bSpace && (!bPunct || aSpace || aPunct)) return true;
-      k = j;
-    }
-  }
 
   let i = 0;
-  let prevChar = '';
-  refsGlobal = refs;
   // Link-backtick poisoning (probed): after a link whose text has two
   // or more backtick runs but NO code span closes within it (the
   // "``b`" pattern, e.g. "[a ``b`](...)"), every emphasis span that
@@ -1355,146 +1558,19 @@ function inlineParse(s, refs, inLink) {
   // delimiter before it is literal, one at/after it is normal.
   let poisoned = false;
   let poisonUntil = -1;
-  // Start position of the last code span at or after `from` (mimics
-  // this inlineParse's left-to-right scan), or -1 if there is none.
-  function findLastCodeSpanStart(from) {
-    let last = -1, k = from;
-    while (k < s.length) {
-      if (s[k] === '`') {
-        const cs = parseCodeSpan(s, k);
-        if (cs) { last = k; k = cs.next; continue; }
-        while (k < s.length && s[k] === '`') k++;
-        continue;
-      }
-      k++;
-    }
-    return last;
-  }
 
-  function pushText(str) {
-    if (!str) return;
-    out.push(str);
-    prevChar = str[str.length - 1];
-  }
-
-  function handleDelimRun(ch, n, canOpen, canClose, pos) {
-    // push the run as its own fragment
-    out.push(ch.repeat(n));
-    const idx = out.length - 1;
-    const rec = { ch, rem: n, canOpen, canClose, idx, pos, origN: n };
-    if (canClose) {
-      // try to match openers
-      while (rec.rem > 0) {
-        let found = -1;
-        let closeFromEnd = false; // strong takes the LAST two of the closer run (see below)
-        for (let d = delims.length - 1; d >= 0; d--) {
-          const o = delims[d];
-          if (o.ch !== ch || !o.canOpen) continue;
-          // Odd-match rule: if either delimiter can both open and close,
-          // the SUM of the two run lengths must not be a multiple of 3
-          // unless both lengths are multiples of 3 (cm-411 "*foo**bar**"
-          // must not match the lone "*" with the "**").
-          if ((o.canClose || rec.canOpen) && (o.rem + rec.rem) % 3 === 0 &&
-              (o.rem % 3 !== 0 || rec.rem % 3 !== 0)) continue;
-          // marked emphasis quirks (probed against marked 18.1.3; not
-          // CommonMark). A "*" span must not enclose a span of the
-          // OPPOSITE type that is not attached to a preceding word
-          // character (letter, digit or '~') but is directly followed
-          // by one ("*a **b**c*" and "**a *b*c**" stay literal).
-          // For an em span the closer stays literal. For a strong span
-          // with exactly 2 delimiters left in the closer run the closer
-          // also stays literal; with 3+ left the strong still forms but
-          // takes the LAST two of the run, so the extra delimiters land
-          // inside it as literal content ("**a *b*c***" ->
-          // "<strong>a <em>b</em>c*</strong>").
-          if (ch === '*') {
-            const useCand = (o.rem >= 2 && rec.rem >= 2) ? 2 : 1;
-            if (badInnerSpan(o, rec, n, useCand)) {
-              if (useCand === 1 || rec.rem === 2) continue;
-              closeFromEnd = true;
-            } else if (useCand === 1) {
-              // A single "*" closer must not split a "**" opener that
-              // has exactly 2 left when a later "**" can close it as a
-              // strong ("**public as *so*other* option html**").
-              // With 3+ left (cm-430 "***foo* bar**") the split still
-              // leaves a strong, so the em is allowed.
-              if (o.rem === 2 && laterStrongCloser(pos + n)) continue;
-            }
-          }
-          found = d;
-          break;
-        }
-        if (found < 0) break;
-        const o = delims[found];
-        const use = (o.rem >= 2 && rec.rem >= 2) ? 2 : 1;
-        const tag = use === 2 ? ['<strong>', '</strong>'] : ['<em>', '</em>'];
-        // opener element = remaining chars + old tags
-        const oEl = out[o.idx];
-        out[o.idx] = ch.repeat(o.rem - use) + tag[0] + oEl.slice(o.rem);
-        // closer element = old tags + remaining chars. Normally the
-        // matched delimiters are the FIRST `use` of the closer run and
-        // the rest stay after the tag; when closeFromEnd the matched
-        // delimiters are the LAST `use` and the rest go before the tag
-        // as literal content.
-        const cEl = out[rec.idx];
-        if (closeFromEnd) {
-          out[rec.idx] = cEl.slice(0, cEl.length - rec.rem) + ch.repeat(rec.rem - use) + tag[1];
-        } else {
-          out[rec.idx] = cEl.slice(0, cEl.length - rec.rem) + tag[1] + ch.repeat(rec.rem - use);
-        }
-        // Record "*" emphasis spans (source range + use) for
-        // badInnerSpan. The opening delimiter(s) are the last `use` of
-        // the opener run; the closing delimiter(s) are the first `use`
-        // of the closer run (or the last `use` when closeFromEnd).
-        // Only "*" spans count; "__" does not.
-        if (ch === '*') {
-          const closeEnd = closeFromEnd ? rec.pos + n : rec.pos + (n - rec.rem) + use;
-          starSpans.push([o.pos + o.origN - use, closeEnd, use]);
-        }
-        o.rem -= use;
-        rec.rem -= use;
-        if (closeFromEnd) rec.rem = 0; // the rest of the run is literal content now
-        // Openers between the matched opener and this closer are now
-        // inside the created emphasis: they can no longer form emphasis
-        // spanning its boundary (cm-469 "*foo _bar* baz_" — the "_" inside
-        // must not match the "_" after the closing "*").
-        if (found < delims.length - 1) delims.splice(found + 1);
-        if (o.rem === 0) delims.splice(found, 1);
-      }
-    }
-    if (rec.rem > 0 && rec.canOpen) {
-      // The remainder of this run acted as a closer, so its element now
-      // holds [closing tags][remaining delims]. Split it: the tags stay
-      // in place, and the remaining delims become their own fragment
-      // right after, so a later match treats them as a plain opener
-      // (otherwise the opener slice logic mangles the tags — the
-      // "<em>/em>" corruption in cm-411/412). A run that never matched
-      // as a closer is a pure delimiter run and needs no split.
-      const el = out[rec.idx];
-      if (el.length > rec.rem) {
-        out[rec.idx] = el.slice(0, el.length - rec.rem);
-        out.splice(rec.idx + 1, 0, el.slice(el.length - rec.rem));
-        for (const d of delims) { if (d.idx > rec.idx) d.idx++; }
-        rec.idx = rec.idx + 1;
-      }
-      delims.push(rec);
-    } else if (rec.rem > 0) {
-      // remaining chars are literal; leave the fragment as-is
-    }
-  }
-
-  while (i < s.length) {
-    const c = s[i];
+  scan: while (i < s.length) {
     const code = s.charCodeAt(i);
+    if (SPECIAL[code]) {
+    const c = s[i];
     // backslash escape
     if (c === '\\' && i + 1 < s.length && isPunctCode(s.charCodeAt(i + 1))) {
-      pushText(escapeText(s[i + 1]));
+      out.push(escapeText(s[i + 1]));
       i += 2;
       continue;
     }
     if (c === '\\' && i + 1 < s.length && s[i + 1] === '\n') {
       out.push('<br>');
-      prevChar = '\n';
       i += 2;
       // A hard break strips the leading spaces of the next line (cm-637).
       while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
@@ -1503,37 +1579,19 @@ function inlineParse(s, refs, inLink) {
     // code span
     if (c === '`') {
       const cs = parseCodeSpan(s, i);
-      if (cs) { pushText(cs.html); i = cs.next; continue; }
+      if (cs) { out.push(cs.html); i = cs.next; continue; }
       // No matching closer: the whole opening run is literal text (a
       // shorter run inside it must not be retried as an opener — cm-347
       // "```foo``" stays literal, the "``" inside is not a code span).
       let j = i;
       while (j < s.length && s[j] === '`') j++;
-      pushText(s.slice(i, j));
-      i = j;
-      continue;
-    }
-    // hard break: two+ spaces + newline
-    if (c === ' ' || c === '\t') {
-      let j = i, spaces = 0;
-      while (j < s.length && (s[j] === ' ' || s[j] === '\t')) { j++; spaces++; }
-      if (s[j] === '\n' && spaces >= 2) {
-        out.push('<br>');
-        prevChar = '\n';
-        i = j + 1;
-        // A hard break strips the leading spaces of the next line (cm-636).
-        while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
-        continue;
-      }
-      // plain spaces: emit as-is (they are part of the text run)
-      pushText(s.slice(i, j));
+      out.push(s.slice(i, j));
       i = j;
       continue;
     }
     // soft break
     if (c === '\n') {
       out.push('\n');
-      prevChar = '\n';
       i++;
       continue;
     }
@@ -1544,7 +1602,7 @@ function inlineParse(s, refs, inLink) {
       // Link-backtick poisoning: while poisoned, an emphasis delimiter
       // before the last code span is literal text (it cannot open or
       // close a span); one at/after it is normal.
-      if (poisoned && i < poisonUntil) { pushText(s.slice(i, j)); i = j; continue; }
+      if (poisoned && i < poisonUntil) { out.push(s.slice(i, j)); i = j; continue; }
       const before = i === 0 ? '' : s[i - 1];
       const after = j < s.length ? s[j] : '';
       const beforeIsSpace = before === '' || isUniSpace(before.charCodeAt(0)) || before === '\n';
@@ -1561,9 +1619,13 @@ function inlineParse(s, refs, inLink) {
         canOpen = leftFlanking && (!rightFlanking || beforeIsPunct);
         canClose = rightFlanking && (!leftFlanking || afterIsPunct);
       }
-      handleDelimRun(c, n, canOpen, canClose, i);
+      // A run that can neither open nor close is pure literal text:
+      // skip the delimiter record, the ch.repeat allocation and the
+      // matching loop entirely (common for '_' in snake_case words
+      // and '*' used as multiplication).
+      if (!canOpen && !canClose) { out.push(s.slice(i, j)); i = j; continue; }
+      handleDelimRun(s, out, delims, starSpans, c, n, canOpen, canClose, i);
       i = j;
-      prevChar = c;
       continue;
     }
     // strikethrough. Allowed inside link text (the reference renders
@@ -1572,11 +1634,10 @@ function inlineParse(s, refs, inLink) {
       const st = parseStrikethrough(s, i, inLink);
       if (st) {
         out.push(st.html);
-        prevChar = '>';
         i = st.next;
         continue;
       }
-      pushText('~');
+      out.push('~');
       i++;
       continue;
     }
@@ -1591,10 +1652,10 @@ function inlineParse(s, refs, inLink) {
         let close = findLinkEnd(s, i, true);
         if (close < 0) close = findLinkEndLiteral(s, i, true);
         if (close >= 0 && linkTextBackticksLiteral(s.slice(i + 1, close))) {
-          const lastCS = findLastCodeSpanStart(lnk.next);
+          const lastCS = findLastCodeSpanStart(s, lnk.next);
           if (lastCS >= 0) { poisoned = true; poisonUntil = lastCS; }
         }
-        out.push(lnk.html); prevChar = '>'; i = lnk.next; continue;
+        out.push(lnk.html); i = lnk.next; continue;
       }
       // The link did not form, but its bracketed text still poisons
       // emphasis inside it when it contains a code span whose content
@@ -1610,7 +1671,7 @@ function inlineParse(s, refs, inLink) {
           poisoned = true; poisonUntil = close;
         }
       }
-      pushText(c);
+      out.push(c);
       i++;
       continue;
     }
@@ -1620,12 +1681,12 @@ function inlineParse(s, refs, inLink) {
         let close = findLinkEnd(s, i + 1, true);
         if (close < 0) close = findLinkEndLiteral(s, i + 1, true);
         if (close >= 0 && linkTextBackticksLiteral(s.slice(i + 2, close))) {
-          const lastCS = findLastCodeSpanStart(lnk.next);
+          const lastCS = findLastCodeSpanStart(s, lnk.next);
           if (lastCS >= 0) { poisoned = true; poisonUntil = lastCS; }
         }
-        out.push(lnk.html); prevChar = '>'; i = lnk.next; continue;
+        out.push(lnk.html); i = lnk.next; continue;
       }
-      pushText(c);
+      out.push(c);
       i++;
       continue;
     }
@@ -1634,7 +1695,7 @@ function inlineParse(s, refs, inLink) {
     // only [text](url) links are barred by inLink.
     if (c === '<') {
       const al = parseAngleAutolink(s, i);
-      if (al) { out.push(al.html); prevChar = '>'; i = al.next; continue; }
+      if (al) { out.push(al.html); i = al.next; continue; }
       const tag = parseHtmlTag(s, i);
       if (tag) {
         // Document-persistent inLink (see docInLink): a raw "<a " tag
@@ -1645,31 +1706,31 @@ function inlineParse(s, refs, inLink) {
         const t = tag.html;
         if (t.length > 2 && t[0] === '<' && (t[1] === 'a' || t[1] === 'A') && t[2] === ' ') docInLink = true;
         else if (t.length > 3 && t[0] === '<' && t[1] === '/' && (t[2] === 'a' || t[2] === 'A') && t[3] === '>') docInLink = false;
-        out.push(tag.html); prevChar = '>'; i = tag.next; continue;
+        out.push(tag.html); i = tag.next; continue;
       }
-      pushText('&lt;');
+      out.push('&lt;');
       i++;
       continue;
     }
     // entity
     if (c === '&') {
       const e = parseEntity(s, i);
-      if (e) { pushText(e.html); i = e.next; continue; }
-      pushText('&amp;');
+      if (e) { out.push(e.html); i = e.next; continue; }
+      out.push('&amp;');
       i++;
       continue;
     }
-    if (c === '>') { pushText('&gt;'); i++; continue; }
+    if (c === '>') { out.push('&gt;'); i++; continue; }
     // extended autolink: www. / http(s):// ("www." lowercase only;
     // the http(s):// scheme is case-insensitive)
-    if ((c === 'w' && s.startsWith('www.', i)) || (c === 'h' || c === 'H') && (s.slice(i, i + 7).toLowerCase() === 'http://' || s.slice(i, i + 8).toLowerCase() === 'https://')) {
+    if ((c === 'w' && s.startsWith('www.', i)) || (c === 'h' || c === 'H') && isHttpAt(s, i)) {
       const prev = i === 0 ? '' : s[i - 1];
       // '<' is also a valid preceding char (cm-602: "<https://foo.bar/baz
       // bim>" links the URL; the '<' itself stays literal).
       if (prev === '' || isUniSpace(prev.charCodeAt(0)) || prev === '*' || prev === '_' || prev === '~' || prev === '(' || prev === '<') {
         if (!inLink && !docInLink) {
           const u = tryExtendedUrl(s, i);
-          if (u) { out.push(u.html); prevChar = '>'; i = u.next; continue; }
+          if (u) { out.push(u.html); i = u.next; continue; }
         }
       }
     }
@@ -1677,40 +1738,49 @@ function inlineParse(s, refs, inLink) {
     if (c === '@' && !inLink) {
       // handled below in the text run; fall through
     }
-    // plain text run: up to the next special char
-    let j = i;
-    let runEnd = s.length;
-    while (j < s.length) {
-      const d = s[j];
-      if (d === '\\' || d === '`' || d === '*' || d === '~' || d === '[' || d === '!' || d === '<' || d === '&' || d === '>' || d === '\n' || d === ' ' || d === '\t') break;
-      if (d === '_') {
-        // A '_' inside a potential email address (a '@' later in the
-        // word) is part of the email, not an emphasis delimiter
-        // (gfm-632: "a.b-c_d@a.b").
-        if (wordHasAt(s, j)) { j++; continue; }
-        break;
-      }
-      // Stop before a www./http(s):// URL so the main loop can try the
-      // extended autolink (gfm-625: "(www.google.com/...)" must link even
-      // though the run starts at the opening paren). "www." is
-      // lowercase-only; the http(s):// scheme is case-insensitive.
-      if ((d === 'w' && s.startsWith('www.', j)) || (d === 'h' || d === 'H') && (s.slice(j, j + 7).toLowerCase() === 'http://' || s.slice(j, j + 8).toLowerCase() === 'https://')) break;
-      j++;
+    } // end if (SPECIAL[code]) — chars outside it fall through to the run
+    // plain text run: up to the next special char. A single regex
+    // scan (C-speed) replaces the per-character JS loop. '_' is a
+    // stop only when it is not part of a potential email word, so
+    // resume the scan past such a '_' (same rule as the old loop).
+    TEXT_STOP.lastIndex = i;
+    let m = TEXT_STOP.exec(s);
+    while (m && s[m.index] === '_' && wordHasAt(s, m.index)) {
+      TEXT_STOP.lastIndex = m.index + 1;
+      m = TEXT_STOP.exec(s);
     }
+    let j = m ? m.index : s.length;
     if (j === i) {
       // A special char no branch above consumed: a lone '!' (not followed
       // by '['), or '~' / '[' inside a link (their branches only run
       // outside links). Emit it as plain text; without this the loop never
       // advances on such input ("return!" hung the parser forever).
-      pushText(s[i]);
+      out.push(s[i]);
       i++;
       continue;
     }
     let text = s.slice(i, j);
-    // extended email autolink inside this run
+    // extended email autolink inside this run. Spaces now ride inside
+    // the run, so it may hold several words: try each word's first
+    // '@' in order (the old code tried one '@' per space-separated
+    // run); a failed word does not hide a later word's email
+    // (gfm-631). An '@' at the very start of the run is never tried.
     if (!inLink && !docInLink) {
-      const at = text.indexOf('@');
-      if (at > 0) {
+      let from = 0;
+      while (true) {
+        // next '@' that is the first '@' of its space-separated word
+        let at = -1;
+        let sf = from;
+        while (true) {
+          const a = text.indexOf('@', sf);
+          if (a < 0) break;
+          let ws = a - 1;
+          while (ws >= 0 && text[ws] !== ' ' && text[ws] !== '\t' && text[ws] !== '\n') ws--;
+          if (text.indexOf('@', ws + 1) === a) { at = a; break; }
+          sf = a + 1;
+        }
+        if (at < 0) break;
+        if (at === 0) { from = 1; continue; }
         // A '_' after the domain is a closing emphasis delimiter (not a
         // trailing underscore) when an '_' opener is on the stack.
         const allowUnderscore = delims.some(d => d.ch === '_');
@@ -1727,16 +1797,32 @@ function inlineParse(s, refs, inLink) {
           const prev = linkStart === 0 ? '' : s[linkStart - 1];
           if (prev === '' || isUniSpace(prev.charCodeAt(0)) || prev === '*' || prev === '_' || prev === '~' || prev === '(' || prev === '<') {
             const before = s.slice(i, linkStart);
-            if (before) pushText(escapeText(decodeNumericRefs(before)));
+            if (before) out.push(escapeTextRun(before));
             out.push(linkHtml);
-            prevChar = '>';
             i = linkNext;
-            continue;
+            continue scan;
           }
         }
+        from = at + 1;
       }
     }
-    pushText(escapeText(decodeNumericRefs(text)));
+    // Hard break: the run ends in 2+ spaces/tabs right before '\n'
+    // (spaces now ride inside the run; the old space branch is gone).
+    // The text before them is emitted, then <br>, and the leading
+    // spaces of the next line are stripped (cm-636).
+    if (j < s.length && s[j] === '\n') {
+      let k = j - 1, tw = 0;
+      while (k >= i && (s[k] === ' ' || s[k] === '\t')) { tw++; k--; }
+      if (tw >= 2) {
+        const before = s.slice(i, k + 1);
+        if (before) out.push(escapeTextRun(before));
+        out.push('<br>');
+        i = j + 1;
+        while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
+        continue;
+      }
+    }
+    out.push(escapeTextRun(text));
     i = j;
   }
   return out.join('');
@@ -2727,8 +2813,11 @@ function parseList(lines, i, b, refs, tailNl) {
     // (a trailing blank line consumed by the item still means "followed",
     // because lastIdx points at the last line actually pushed).
     // If the list is tight the provisional parse is already correct; if
-    // loose, re-parse with tight=false for the <p> wrappers.
-    const useInner = tight ? inner : (() => { inListItem++; try { return parseBlocks(item.lines, 0, item.lines.length, refs, item.lastIdx + 1 < b ? true : tailNl, false, item.lazy); } finally { inListItem--; } })();
+    // loose, re-parse with tight=false for the <p> wrappers. In
+    // collectOnly mode (pass 1) the output is discarded and the
+    // provisional parse already collected every definition in the
+    // items, so the re-parse is pure waste — skip it.
+    const useInner = (tight || collectOnly) ? inner : (() => { inListItem++; try { return parseBlocks(item.lines, 0, item.lines.length, refs, item.lastIdx + 1 < b ? true : tailNl, false, item.lazy); } finally { inListItem--; } })();
     lastType = useInner.lastType;
     let itemHtml = useInner.html;
     if (item.task) {
@@ -2750,7 +2839,8 @@ function parseList(lines, i, b, refs, tailNl) {
 
 export function parse(src) {
   docInLink = false;
-  src = src.replace(/\r\n?/g, '\n');
+  // Most documents have no '\r'; skip the whole-input regex scan then.
+  if (src.indexOf('\r') >= 0) src = src.replace(/\r\n?/g, '\n');
   const lines = src.split('\n');
   const refs = new Map();
   // Pass 1: collect every link reference definition in the document
