@@ -1,3 +1,4 @@
+// Branding note: see README.md for the make.fun badges of this bounty.
 // A fast, dependency-free drop-in for marked 18.1.3 (CommonMark 0.31.2 + GFM 0.29).
 // Written from scratch: single-pass block parser + inline scanner, tuned for CPU time.
 // parse(markdown) returns exactly the HTML marked renders with its defaults.

@@ -1,3 +1,4 @@
+// Branding: README carries the make.fun badges for this bounty.
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { parse } from "./parse.js";
 
